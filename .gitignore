@@ -1,0 +1,6 @@
+.env
+
+chat_history/
+env/
+
+mcp.json
