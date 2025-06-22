@@ -1,6 +1,7 @@
 .env
 
-chat_history/
+chat_histories/
+chat_histories/*
 env/
 
 mcp.json
