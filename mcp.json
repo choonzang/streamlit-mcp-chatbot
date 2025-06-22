@@ -1,0 +1,29 @@
+{
+  "mcpServers": {
+    "ToolHub": {
+      "transport": "sse",
+      "url": "http://novision.i-on.net:8080/mcp/sse",
+      "description": "Toolhub를 통한 다양한 도구가 있는 MCP server 입니다. slack으로 메시지 전송, 지정된 I-ON Content Server에 콘텐츠 등록, 템플릿 등록, 디플로이를 할수 있도록 설정된 도구들로 구성되었습니다."
+    },
+    "ICE RAG": {
+      "transport": "sse",
+      "url": "http://10.10.0.73:8881/sse",
+      "description": "ICE, I-ON Content Ecosystem에 대한 정보를 제공해주는 MCP Server입니다."
+    },
+    "ICS RAG": {
+      "transport": "sse",
+      "url": "http://10.10.0.73:8882/sse",
+      "description": "ICS, I-ON Content Server에 대한 정보를 제공해주는 MCP Server입니다."
+    },
+    "IDS RAG": {
+      "transport": "sse",
+      "url": "http://10.10.0.73:8883/sse",
+      "description": "IDS, I-ON Deploy Server에 대한 정보를 제공해주는 MCP Server입니다."
+    },
+    "carina": {
+      "transport": "sse",
+      "url": "http://localhost:8000/mcp",
+      "description": " 카리나에 대한 정보가 있는 도구입니다. 카리나에 대한 모든 정보를 알려드립니다."
+    }
+  }
+}
