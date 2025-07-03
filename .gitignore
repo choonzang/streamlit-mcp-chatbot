@@ -5,3 +5,4 @@ chat_histories/*
 env/
 
 mcp.json
+*.bak

@@ -50,7 +50,6 @@ llm_options = {
 #'claude-opus-4-20250514'
 
 # --- 헬퍼 함수 ---
-
 def run_async(func):
     """비동기 함수를 Streamlit에서 실행하기 위한 헬퍼"""
     return asyncio.run(func)
@@ -171,8 +170,9 @@ async def process_query(query: str, chat_history: List):
                         agent = create_react_agent(llm, tools)
                         agent_input = {"messages": chat_history + [HumanMessage(content=query)]}
                         if len(selected_server_names) == 1:
-                            response = await agent.ainvoke(agent_input)
-                            return response.get('output', response['messages'][-1].content if 'messages' in response and isinstance(response['messages'][-1], AIMessage) else "응답 내용 파싱 실패")
+                            with st.spinner("단일 에이전트 실행중..."):
+                                response = await agent.ainvoke(agent_input)
+                                return response.get('output', response['messages'][-1].content if 'messages' in response and isinstance(response['messages'][-1], AIMessage) else "응답 내용 파싱 실패")
                         else:
                             agents[name] = agent
             elif conn_type == "sse":
@@ -189,8 +189,9 @@ async def process_query(query: str, chat_history: List):
                         agent = create_react_agent(llm, tools)
                         agent_input = {"messages": chat_history + [HumanMessage(content=query)]}
                         if len(selected_server_names) == 1:
-                            response = await agent.ainvoke(agent_input)
-                            return response.get('output', response['messages'][-1].content if 'messages' in response and isinstance(response['messages'][-1], AIMessage) else "응답 내용 파싱 실패")
+                            with st.spinner("단일 에이전트 실행중..."):
+                                response = await agent.ainvoke(agent_input)
+                                return response.get('output', response['messages'][-1].content if 'messages' in response and isinstance(response['messages'][-1], AIMessage) else "응답 내용 파싱 실패")
                         else:
                             agents[name] = agent
             else:
@@ -204,47 +205,59 @@ async def process_query(query: str, chat_history: List):
         return "선택된 모든 서버에 연결하지 못했거나, 에이전트를 생성할 수 있는 서버가 없습니다."
 
     st.write(f"`4. {len(agents)}개 에이전트 생성 완료. 질의 실행...`")
-    parallel_runnable = RunnableParallel(**{name: agent for name, agent in agents.items()})
-    
-    try:
-        all_agent_results = await parallel_runnable.ainvoke(agent_input)
-        final_responses = {}
-        for name, result in all_agent_results.items():
-            if 'output' in result:
-                final_responses[name] = result['output']
-            elif 'messages' in result and isinstance(result['messages'][-1], AIMessage):
-                print(f"응답메시지: {result['messages'][-1].content}")
-                final_responses[name] = result['messages'][-1].content
-            else:
-                final_responses[name] = f"[{name}] 응답 내용을 파싱할 수 없습니다."
+    with st.spinner("멀티 에이전트 실행중..."):
+        parallel_runnable = RunnableParallel(**{name: agent for name, agent in agents.items()})
+        
+        try:
+            all_agent_results = await parallel_runnable.ainvoke(agent_input)
+            final_responses = {}
+            for name, result in all_agent_results.items():
+                if 'output' in result:
+                    final_responses[name] = result['output']
+                elif 'messages' in result and isinstance(result['messages'][-1], AIMessage):
+                    print(f"응답메시지: {result['messages'][-1].content}")
+                    final_responses[name] = result['messages'][-1].content
+                else:
+                    final_responses[name] = f"[{name}] 응답 내용을 파싱할 수 없습니다."
 
-        history_str = "\n".join([f"{'User' if isinstance(m, HumanMessage) else 'Assistant'}: {m.content}" for m in chat_history])
-        synthesis_prompt_template = """
-        당신은 여러 AI 에이전트의 응답을 종합하여 사용자에게 최종 답변을 제공하는 마스터 AI입니다.
-        아래 대화 기록을 참고하여 사용자의 질문 의도를 파악하고, 각 에이전트의 응답을 바탕으로 하나의 일관되고 자연스러운 문장으로 답변을 재구성해주세요.
-        Answer only based on the data or information provided by the tools. Don't create information that isn't provied.
-        [대화 기록]
-        {chat_history}
-        [사용자 현재 질문]
-        {original_query}
-        [각 에이전트의 응답]
-        {agent_responses}
-        [종합된 최종 답변]
-        """
-        synthesis_prompt = ChatPromptTemplate.from_template(synthesis_prompt_template)
-        synthesis_chain = synthesis_prompt | llm | StrOutputParser()
-        final_answer = await synthesis_chain.ainvoke({
-            "chat_history": history_str,
-            "original_query": query,
-            "agent_responses": json.dumps(final_responses, ensure_ascii=False, indent=2)
-        })
-        return final_answer
-    except Exception as e:
-        st.error(f"❌ 병렬 에이전트 실행 중 오류 발생: {e}")
-        return f"병렬 에이전트 실행 중 오류가 발생했습니다: {e}"
+            history_str = "\n".join([f"{'User' if isinstance(m, HumanMessage) else 'Assistant'}: {m.content}" for m in chat_history])
+            synthesis_prompt_template = """
+            당신은 여러 AI 에이전트의 응답을 종합하여 사용자에게 최종 답변을 제공하는 마스터 AI입니다.
+            아래 대화 기록을 참고하여 사용자의 질문 의도를 파악하고, 각 에이전트의 응답을 바탕으로 하나의 일관되고 자연스러운 문장으로 답변을 재구성해주세요.
+            Answer only based on the data or information provided by the tools. Don't create information that isn't provied.
+            [대화 기록]
+            {chat_history}
+            [사용자 현재 질문]
+            {original_query}
+            [각 에이전트의 응답]
+            {agent_responses}
+            [종합된 최종 답변]
+            """
+            synthesis_prompt = ChatPromptTemplate.from_template(synthesis_prompt_template)
+            synthesis_chain = synthesis_prompt | llm | StrOutputParser()
+            final_answer = await synthesis_chain.ainvoke({
+                "chat_history": history_str,
+                "original_query": query,
+                "agent_responses": json.dumps(final_responses, ensure_ascii=False, indent=2)
+            })
+            return final_answer
+        except Exception as e:
+            st.error(f"❌ 병렬 에이전트 실행 중 오류 발생: {e}")
+            return f"병렬 에이전트 실행 중 오류가 발생했습니다: {e}"
+
 
 # --- Streamlit UI 구성 ---
-
+st.markdown(
+    """
+    <style>
+    @media(max-width:1024px){
+        .stBottom{
+        bottom:70px;
+        }
+    }
+    </style>
+    """,unsafe_allow_html=True
+)
 st.set_page_config(page_title="MCP Client on Streamlit", layout="wide")
 st.title("🤖 MCP Client")
 
@@ -318,7 +331,7 @@ with st.sidebar:
     # ... (기존 MCP 서버 관리 코드는 변경 없음) ...
     mcp_config = load_mcp_config()
     with st.expander("서버 목록 보기/관리"):
-        st.json(mcp_config)
+        st.json(mcp_config,expanded=False)
         servers = list(mcp_config["mcpServers"].keys())
         server_to_delete = st.selectbox("삭제할 서버 선택", [""] + servers)
         if st.button("선택된 서버 삭제", type="primary"):
@@ -397,15 +410,6 @@ if "current_chat_file" not in st.session_state:
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
-style_code = """
-<style>
-@media (max-width:1024px) {
-    .stBottom {
-        bottom:70px !Important;
-    }
-}
-</style>
-"""
 # 사용자 입력 처리 (★★★★★ 로직 변경 ★★★★★)
 if prompt := st.chat_input("질문을 입력하세요."):
     # 1. 새 채팅인 경우, 활성 파일 이름 생성
