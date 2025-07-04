@@ -21,6 +21,9 @@ from langchain_core.output_parsers import StrOutputParser
 
 from langgraph.prebuilt import create_react_agent
 
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_community.chat_message_histories import ChatMessageHistory
+
 # --- 환경 변수 및 설정 로드 ---
 load_dotenv()
 
@@ -147,52 +150,100 @@ async def process_query(query: str, chat_history: List) -> AsyncGenerator[str, N
         
         try:
             conn_type = config.get("transport")
-            final_output = f"에이전트 '{name}'가 응답을 생성하지 못했습니다."
+            
+            #final_output = f"에이전트 '{name}'가 응답을 생성하지 못했습니다."
 
-            async def get_output_from_connection(read, write):
-                """세션 내에서 에이전트를 실행하고 최종 결과를 반환합니다."""
-                nonlocal final_output
+            async def process_connection_and_stream(read, write):
+                """세션 내에서 에이전트를 실행하고 결과를 스트리밍합니다."""
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     tools = await load_mcp_tools(session)
                     if not tools:
                         st.warning(f"✅ '{name}' 서버에 연결했으나, 사용 가능한 도구가 없습니다.")
-                        final_output = f"'{name}' 서버에서 사용 가능한 도구를 찾지 못했습니다."
+                        yield f"'{name}' 서버에서 사용 가능한 도구를 찾지 못했습니다."
                         return
 
                     st.success(f"✅ '{name}' 서버 연결 및 도구 로드 성공: `{[tool.name for tool in tools]}`")
                     agent = create_react_agent(llm, tools)
-                    
+                    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+
+                    # 채팅 기록을 위한 메모리 설정 (선택 사항)
+                    message_history = ChatMessageHistory()
+
+                    agent_with_chat_history = RunnableWithMessageHistory(
+                        agent_executor,
+                        lambda session_id: message_history,
+                        input_messages_key="input",
+                        history_messages_key="chat_history",
+                    )
+
                     st.write("`4. 에이전트 실행 중...`")
                     with st.spinner(f"'{name}' 에이전트가 도구를 사용하여 작업 중입니다..."):
-                        result = await agent.ainvoke(agent_input)
-                        print(f"에이전시 실행 result : {result}")
-                        if 'output' in result:
-                            final_output = result['output']
-                        elif 'messages' in result and isinstance(result['messages'][-1], AIMessage):
-                            final_output = result['messages'][-1].content
-                        
-            
+                        # agent.astream이 생성하는 청크에서 메시지 내용을 추출하여 바로 yield 합니다.
+                        # async for chunk in agent.astream(agent_input):
+                        #     print(chunk)
+                        #     if "agent" in chunk and "messages" in chunk["agent"] and chunk["agent"]["messages"]:
+                        #         # 'messages' 리스트의 마지막 항목에서 content를 추출합니다.
+                        #         message_content = chunk["agent"]["messages"][-1].content
+                        #         if message_content:
+                        #             yield message_content
+
+
+                        final_answer = ""
+                        # print("Agent is thinking...", end="", flush=True)
+
+                        # astream_events를 사용하여 이벤트 스트림을 받습니다.
+                        async for event in agent_with_chat_history.astream_events(
+                            agent_input,
+                            config={"configurable": {"session_id": "test_session"}},
+                            version="v1",
+                        ):
+                            kind = event["event"]
+                            
+                            # 에이전트의 중간 생각(thought) 출력
+                            # if kind == "on_chain_start" and event["name"] == "Agent":
+                            #     print("\n🔄 Agent Start")
+                                
+                            # LLM이 생성하는 응답 청크(chunk)를 실시간으로 출력
+                            if kind == "on_chat_model_stream":
+                                content = event["data"]["chunk"].content
+                                if content:
+                                    # print(content, end="", flush=True)
+                                    yield content
+                                    final_answer += content
+
+                            # 도구 사용 종료 시 출력
+                            # elif kind == "on_tool_end":
+                            #     print(f"\n✅ Tool Output: {event['data'].get('output')}")
+                            #     print("\n---\nAgent is thinking...", end="", flush=True)
+
+                        # print("\n\n--- 최종 답변 ---")
+                        yield final_answer
+
             # Transport 타입에 따라 연결 및 실행
             if conn_type == "stdio":
                 params = StdioServerParameters(command=config.get("command"), args=config.get("args", []))
                 async with stdio_client(params) as (read, write):
-                    await get_output_from_connection(read, write)
+                    async for content_part in process_connection_and_stream(read, write):
+                        yield content_part
             elif conn_type == "sse":
                 url = config.get("url")
                 headers = config.get("headers", {})
                 async with sse_client(url, headers=headers) as (read, write):
-                    await get_output_from_connection(read, write)
+                    async for content_part in process_connection_and_stream(read, write):
+                        yield content_part
             else:
                 st.warning(f"⚠️ '{name}' 서버의 연결 타입 ('{conn_type}')을 지원하지 않습니다.")
-                final_output = f"지원하지 않는 연결 타입: '{conn_type}'"
-            
-            yield final_output
-
+                yield f"지원하지 않는 연결 타입: '{conn_type}'"
+               
         except Exception as e:
-            st.error(f"❌ '{name}' 에이전트 실행 중 오류 발생: {e}")
-            yield f"에이전트 실행 중 오류가 발생했습니다: {e}"
-        return
+            if "Attempted to exit cancel scope in a different task than it was entered in" in str(e):                
+                pass
+            else:                
+                st.error(f"❌ '{name}' 에이전트 실행 중 오류 발생: {e}")
+                yield f"에이전트 실행 중 오류가 발생했습니다: {e}"
+        
+        return # 단일 서버 실행 후 함수 종료
 
     # 4. 멀티 서버 실행
     if len(selected_server_names) > 1:
