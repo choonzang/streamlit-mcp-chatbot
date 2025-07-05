@@ -359,11 +359,15 @@ with st.sidebar:
     st.button("새로운 채팅 열기", on_click=start_new_chat, use_container_width=True)
     st.divider()
     localS = LocalStorage()
-    
+
     #localStorage에서 이전에 저장된 값 불러오기
     saved_model = localS.getItem("selected_model")
-    saved_category =  saved_model[0]
-    saved_item = saved_model[1]
+    if saved_model:
+        saved_category =  saved_model[0]
+        saved_item = saved_model[1]
+    else:
+        saved_category = ""
+        saved_item = ""
 
     #1. 첫 번째 selectbox(카테고리)의 기본 인덱스 설정
     categories = list(llm_options.keys())
