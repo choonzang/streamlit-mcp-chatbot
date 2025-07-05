@@ -1,4 +1,6 @@
 import streamlit as st
+from streamlit_local_storage import LocalStorage
+
 import os
 import json
 import time
@@ -137,12 +139,12 @@ async def process_query(query: str, chat_history: List) -> AsyncGenerator[str, N
 
     # 2. 연결할 MCP 서버가 없을 경우, LLM으로 직접 질의
     if not selected_server_names:
-        st.info("✅ 적합한 도구를 찾지 못했습니다. LLM이 직접 답변합니다.")
+        st.info("✅ LLM이 직접 답변합니다.")
         async for chunk in llm.astream(agent_input["messages"]):
             yield chunk.content
         return
 
-    # 3. 단일 서버 실행 (ainvoke 방식으로 변경)
+    # 3. 단일 서버 실행
     if len(selected_server_names) == 1:
         name = selected_server_names[0]
         config = mcp_config[name]
@@ -179,24 +181,12 @@ async def process_query(query: str, chat_history: List) -> AsyncGenerator[str, N
 
                     st.write("`4. 에이전트 실행 중...`")
                     with st.spinner(f"'{name}' 에이전트가 도구를 사용하여 작업 중입니다..."):
-                        # agent.astream이 생성하는 청크에서 메시지 내용을 추출하여 바로 yield 합니다.
-                        # async for chunk in agent.astream(agent_input):
-                        #     print(chunk)
-                        #     if "agent" in chunk and "messages" in chunk["agent"] and chunk["agent"]["messages"]:
-                        #         # 'messages' 리스트의 마지막 항목에서 content를 추출합니다.
-                        #         message_content = chunk["agent"]["messages"][-1].content
-                        #         if message_content:
-                        #             yield message_content
-
-
                         final_answer = ""
-                        # print("Agent is thinking...", end="", flush=True)
-
                         # astream_events를 사용하여 이벤트 스트림을 받습니다.
                         async for event in agent_with_chat_history.astream_events(
                             agent_input,
                             config={"configurable": {"session_id": "test_session"}},
-                            version="v1",
+                            version="v2",
                         ):
                             kind = event["event"]
                             
@@ -368,14 +358,43 @@ with st.sidebar:
 
     st.button("새로운 채팅 열기", on_click=start_new_chat, use_container_width=True)
     st.divider()
+    localS = LocalStorage()
+    
+    #localStorage에서 이전에 저장된 값 불러오기
+    saved_model = localS.getItem("selected_model")
+    saved_category =  saved_model[0]
+    saved_item = saved_model[1]
 
-    st.header("LLM 관리")
-    selected_category = st.selectbox("LLM를 선택하세요:", list(llm_options.keys()))
-    if selected_category:
-        st.subheader(f"{selected_category} 모델 선택")
-        selected_item = st.selectbox(f"{selected_category} 중에서 선택하세요:", llm_options[selected_category])
-    else:
-        selected_item = None
+    #1. 첫 번째 selectbox(카테고리)의 기본 인덱스 설정
+    categories = list(llm_options.keys())
+    #2. 저장된 값이 있으면 해당 값의 인덱스를, 없으면 0을 기본값으로 사용
+    category_index = categories.index(saved_category) if saved_category in categories else 0
+
+    st.header("LLM 관리")  
+
+    # 카테고리 selectbox 생성
+    selected_category = st.selectbox(
+        "LLM를 선택하세요:",
+        categories,
+        index=category_index
+    )
+
+    # 3. 두 번째 selectbox(모델)의 기본 인덱스 설정
+    model_options = llm_options[selected_category]
+    # 저장된 모델이 현재 선택된 카테고리 내에 있는지 확인 후 인덱스 설정
+    item_index = model_options.index(saved_item) if saved_item in model_options else 0
+
+    # 모델 selectbox 생성
+    selected_item = st.selectbox(
+        f"{selected_category} 중에서 선택하세요:",
+        model_options,
+        index=item_index
+    )
+    # 4. 현재 선택된 값을 localStorage에 저장
+    # 사용자가 값을 변경하면 Streamlit이 스크립트를 재실행하므로, 
+    # 이 코드는 항상 최신 선택 값을 저장하게 됩니다.
+    localS.setItem("selected_model", [selected_category,selected_item])
+   
 
     st.divider()
     st.header("MCP 서버 관리")
