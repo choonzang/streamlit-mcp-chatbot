@@ -36,7 +36,6 @@ def get_youtube_transcript(url: str) -> str:
         
         # 3. 자막 목록의 'text' 부분을 하나의 문자열로 결합합니다.
         transcript_text = " ".join([entry["text"] for entry in transcript_list])
-        print(transcript_text)
         return transcript_text
 
     except Exception as e:

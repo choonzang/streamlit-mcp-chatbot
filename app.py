@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from typing import List, Dict, AsyncGenerator
 from datetime import datetime
 from pathlib import Path
+import tiktoken
 
 # LangChain 관련 라이브러리
 from langchain_core.tools import tool
@@ -55,6 +56,16 @@ llm_options = {
 #'claude-opus-4-20250514'
 
 # --- 헬퍼 함수 ---
+# <<< [수정] 토큰 계산 헬퍼 함수 추가 시작 >>>
+def count_tokens(text: str, model: str = "gpt-4") -> int:
+    """주어진 텍스트의 토큰 수를 계산합니다."""
+    try:
+        # 모델에 맞는 인코딩 방식을 가져옵니다.
+        encoding = tiktoken.encoding_for_model(model)
+    except KeyError:
+        # 모델을 찾을 수 없을 경우 기본 인코딩을 사용합니다.
+        encoding = tiktoken.get_encoding("cl100k_base")
+    return len(encoding.encode(text))
 
 def generate_filename_with_timestamp(prefix="chat_", extension="json"):
     """타임스탬프를 포함한 파일명을 생성합니다."""
@@ -129,9 +140,33 @@ async def process_query(query: str, chat_history: List) -> AsyncGenerator[str, N
     사용자 질의를 받아 서버 선택, 에이전트 생성 및 실행의 전체 과정을 처리합니다.
     'cancel scope' 오류를 해결하기 위해 단일 에이전트 실행 방식을 ainvoke로 변경합니다.
     """
+
+    # <<< [수정] 대화 기록 관리 로직 시작 >>>
+    MAX_HISTORY_TOKENS = 4096  # LLM에 전달할 최대 히스토리 토큰 수 제한
+
+    history_for_llm = []
+    current_tokens = 0
+
+    # 전체 대화 기록을 최신순으로 순회하며 토큰 수를 확인
+    for message in reversed(chat_history):
+        message_content = message.content
+        # 현재 메시지의 토큰 수를 계산
+        message_tokens = count_tokens(message_content)
+
+        # 이 메시지를 추가하면 최대 토큰 수를 넘는지 확인
+        if current_tokens + message_tokens > MAX_HISTORY_TOKENS:
+            # 넘는다면 더 이상 이전 기록을 추가하지 않고 종료
+            break
+
+        # 토큰 수 제한을 넘지 않으면 기록에 추가 (원본 순서를 위해 맨 앞에 삽입)
+        history_for_llm.insert(0, message)
+        current_tokens += message_tokens
+    # <<< [수정] 대화 기록 관리 로직 끝 >>>
+
     mcp_config = load_mcp_config()["mcpServers"]
     llm = get_llm()
-    agent_input = {"messages": chat_history + [HumanMessage(content=query)]}
+    #agent_input = {"messages": chat_history + [HumanMessage(content=query)]}
+    agent_input = {"messages": history_for_llm + [HumanMessage(content=query)]}
 
     # 1. MCP 서버 라우팅
     st.write("`1. MCP 서버 라우팅 중...`")
@@ -167,7 +202,7 @@ async def process_query(query: str, chat_history: List) -> AsyncGenerator[str, N
 
                     st.success(f"✅ '{name}' 서버 연결 및 도구 로드 성공: `{[tool.name for tool in tools]}`")
                     agent = create_react_agent(llm, tools)
-                    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+                    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, return_intermediate_steps=True)
 
                     # 채팅 기록을 위한 메모리 설정 (선택 사항)
                     message_history = ChatMessageHistory()
@@ -279,7 +314,31 @@ async def process_query(query: str, chat_history: List) -> AsyncGenerator[str, N
 
         tasks = [run_one_agent_and_get_output(name) for name in selected_server_names]
         results = await asyncio.gather(*tasks)
-        final_responses = {name: output for name, output in results if output}
+
+        # <<< [수정] 다중 에이전트 응답 값 처리 로직 시작 >>>
+        MAX_RESPONSE_TOKENS_PER_AGENT = 1500  # 각 에이전트별 최대 응답 토큰 수
+        final_responses = {}
+
+        for name, output in results:
+            if not output:
+                final_responses[name] = "에이전트가 응답을 생성하지 못했습니다."
+                continue
+            
+            # 각 응답의 토큰 수 확인
+            if count_tokens(output) > MAX_RESPONSE_TOKENS_PER_AGENT:
+                # 토큰 수를 기준으로 응답 자르기
+                try:
+                    encoding = tiktoken.encoding_for_model(get_llm().model_name)
+                except KeyError:
+                    encoding = tiktoken.get_encoding("cl100k_base")
+                
+                tokens = encoding.encode(output)
+                truncated_tokens = tokens[:MAX_RESPONSE_TOKENS_PER_AGENT]
+                truncated_output = encoding.decode(truncated_tokens)
+                final_responses[name] = truncated_output + "\n\n... [응답이 너무 길어 일부만 표시됩니다]"
+            else:
+                final_responses[name] = output
+        # <<< [수정] 다중 에이전트 응답 값 처리 로직 끝 >>>
 
         st.write("`4. 모든 에이전트 실행 완료. 최종 답변 종합 중...`")
         st.json(final_responses)
