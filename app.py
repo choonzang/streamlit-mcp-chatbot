@@ -217,6 +217,8 @@ async def process_query(query: str, chat_history: List) -> AsyncGenerator[str, N
                     st.write("`4. 에이전트 실행 중...`")
                     with st.spinner(f"'{name}' 에이전트가 도구를 사용하여 작업 중입니다..."):
                         final_answer = ""
+                        system_prompt_ = "응답의 출처가 있다면, 응답 하단에 출처를 표시해주세요"
+                        agent_input = {"messages": history_for_llm + [SystemMessage(content=system_prompt_), HumanMessage(content=query)]}
                         # astream_events를 사용하여 이벤트 스트림을 받습니다.
                         async for event in agent_with_chat_history.astream_events(
                             agent_input,
@@ -224,7 +226,7 @@ async def process_query(query: str, chat_history: List) -> AsyncGenerator[str, N
                             version="v2",
                         ):
                             kind = event["event"]
-                            
+                            #print(kind)
                             # 에이전트의 중간 생각(thought) 출력
                             # if kind == "on_chain_start" and event["name"] == "Agent":
                             #     print("\n🔄 Agent Start")
