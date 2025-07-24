@@ -507,22 +507,82 @@ with st.sidebar:
 
     st.divider()
     st.header("저장된 대화")
+
+    # 저장된 대화 파일 목록을 최신순으로 정렬
     saved_chats = sorted([f for f in os.listdir(HISTORY_DIR) if f.endswith(".json")], reverse=True)
+
+    # 다이얼로그를 표시할 함수를 데코레이터와 함께 정의합니다.
+    @st.dialog("전체 대화 목록")
+    def show_all_chats_dialog():
+        st.write(f"총 {len(saved_chats)}개의 대화가 있습니다.")
+        # 모달 내에서 전체 대화 목록 표시
+        for filename in saved_chats:
+            d_col1, d_col2, d_col3 = st.columns([0.7, 0.15, 0.15])
+            with d_col1:
+                is_active_chat = st.session_state.get("current_chat_file") == filename
+                label = f"**{filename}**" if is_active_chat else filename
+                st.markdown(label, unsafe_allow_html=True)
+            with d_col2:
+                if st.button("열기", key=f"load_modal_{filename}", use_container_width=True):
+                    load_chat(filename)
+                    st.session_state.show_all_chats = False
+                    st.rerun()
+            with d_col3:
+                if st.button("삭제", key=f"delete_modal_{filename}", use_container_width=True):
+                    delete_chat(filename)
+                    st.session_state.show_all_chats = False
+                    st.rerun()
+        
+        if st.button("닫기", use_container_width=True, type="primary"):
+            st.session_state.show_all_chats = False
+            st.rerun()
+
     if not saved_chats:
         st.write("저장된 대화가 없습니다.")
-    for filename in saved_chats:
-        col1, col2 = st.columns([0.85, 0.15])
-        with col1:
-            is_active_chat = st.session_state.get("current_chat_file") == filename
-            button_type = "primary" if is_active_chat else "secondary"
-            if st.button(filename, key=f"load_{filename}", use_container_width=True, type=button_type):
-                if not is_active_chat:
-                    load_chat(filename)
+    else:
+        recent_chats = saved_chats[:10]
+        older_chats = saved_chats[10:]
+
+        # 최근 10개 대화 목록 표시
+        for filename in recent_chats:
+            col1, col2 = st.columns([0.85, 0.15])
+            with col1:
+                is_active_chat = st.session_state.get("current_chat_file") == filename
+                button_type = "primary" if is_active_chat else "secondary"
+                if st.button(filename, key=f"load_recent_{filename}", use_container_width=True, type=button_type):
+                    if not is_active_chat:
+                        load_chat(filename)
+                        st.rerun()
+            with col2:
+                if st.button("X", key=f"delete_recent_{filename}", use_container_width=True, help=f"{filename} 삭제"):
+                    delete_chat(filename)
                     st.rerun()
-        with col2:
-            if st.button("X", key=f"delete_{filename}", use_container_width=True, help=f"{filename} 삭제"):
-                delete_chat(filename)
-                st.rerun()
+
+        # '더 보기' 버튼
+        if older_chats:
+            if st.button("더 보기...", use_container_width=True):
+                st.session_state.show_all_chats = True
+
+    # 세션 상태에 따라 다이얼로그 함수를 호출합니다.
+    if st.session_state.get("show_all_chats"):
+        show_all_chats_dialog()
+    
+    # saved_chats = sorted([f for f in os.listdir(HISTORY_DIR) if f.endswith(".json")], reverse=True)
+    # if not saved_chats:
+    #     st.write("저장된 대화가 없습니다.")
+    # for filename in saved_chats:
+    #     col1, col2 = st.columns([0.85, 0.15])
+    #     with col1:
+    #         is_active_chat = st.session_state.get("current_chat_file") == filename
+    #         button_type = "primary" if is_active_chat else "secondary"
+    #         if st.button(filename, key=f"load_{filename}", use_container_width=True, type=button_type):
+    #             if not is_active_chat:
+    #                 load_chat(filename)
+    #                 st.rerun()
+    #     with col2:
+    #         if st.button("X", key=f"delete_{filename}", use_container_width=True, help=f"{filename} 삭제"):
+    #             delete_chat(filename)
+    #             st.rerun()
 
 # --- 메인 채팅 인터페이스 ---
 if "messages" not in st.session_state:
