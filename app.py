@@ -101,6 +101,54 @@ def save_mcp_config(config):
     with open(MCP_CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
 
+# <<< [추가] 파일명 변경 헬퍼 함수 시작 >>>
+def rename_chat(old_filename: str, new_filename_base: str):
+    """대화 파일의 이름을 변경하고, 중복 시 숫자를 붙여 처리합니다."""
+    clean_base_name = new_filename_base.strip()
+    if not clean_base_name:
+        st.error("파일 이름은 비워둘 수 없습니다.")
+        return
+
+    new_filename = f"{clean_base_name}.json"
+    old_path = HISTORY_DIR / old_filename
+    new_path = HISTORY_DIR / new_filename
+
+    if old_path == new_path: # 이름이 변경되지 않았으면 함수 종료
+        return
+
+    final_path = new_path
+    final_filename = new_filename
+    
+    # 파일명이 이미 존재하는 경우, 중복되지 않는 새 이름을 찾습니다.
+    if final_path.exists():
+        st.info(f"'{new_filename}' 파일이 이미 존재하여, 뒤에 숫자를 붙여 저장합니다.")
+        
+        counter = 1
+        while True:
+            # '기존이름 (1).json', '기존이름 (2).json' ... 형식으로 새 이름 생성
+            unique_base_name = f"{clean_base_name} ({counter})"
+            unique_filename = f"{unique_base_name}.json"
+            unique_path = HISTORY_DIR / unique_filename
+            
+            if not unique_path.exists():
+                final_path = unique_path
+                final_filename = unique_filename
+                break # 유니크한 이름을 찾았으므로 루프 종료
+            
+            counter += 1
+
+    try:
+        old_path.rename(final_path)
+        # 사용자에게 최종적으로 변경된 파일명을 알려줍니다.
+        st.toast(f"'{old_filename}'을 '{final_filename}'(으)로 변경했습니다.")
+        
+        if st.session_state.get("current_chat_file") == old_filename:
+            st.session_state.current_chat_file = final_filename
+            
+    except Exception as e:
+        st.error(f"파일 이름 변경 중 오류 발생: {e}")
+# <<< [수정] 파일명 변경 및 중복 처리 로직 강화 끝 >>>
+
 # --- 핵심 로직 함수 ---
 async def select_mcp_servers(query: str, servers_config: Dict) -> List[str]:
     """사용자 질의에 기반하여 사용할 MCP 서버를 LLM을 통해 선택합니다."""
@@ -508,33 +556,82 @@ with st.sidebar:
     st.divider()
     st.header("저장된 대화")
 
-    # 저장된 대화 파일 목록을 최신순으로 정렬
-    saved_chats = sorted([f for f in os.listdir(HISTORY_DIR) if f.endswith(".json")], reverse=True)
+    # <<< [수정] 대화 목록 관리 로직 전체 변경 시작 >>>
+    if "editing_chat_file" not in st.session_state:
+        st.session_state.editing_chat_file = None
 
-    # 다이얼로그를 표시할 함수를 데코레이터와 함께 정의합니다.
-    @st.dialog("전체 대화 목록")
-    def show_all_chats_dialog():
-        st.write(f"총 {len(saved_chats)}개의 대화가 있습니다.")
-        # 모달 내에서 전체 대화 목록 표시
-        for filename in saved_chats:
-            d_col1, d_col2, d_col3 = st.columns([0.7, 0.15, 0.15])
-            with d_col1:
+    def display_chat_item(filename: str, key_prefix: str):
+        """대화 목록 아이템을 표시하고 수정/삭제 UI를 제공하는 함수"""
+        is_editing = st.session_state.get("editing_chat_file") == filename
+
+        if is_editing:
+            # 이름 수정 모드 UI
+            c1, c2, c3 = st.columns([0.7, 0.15, 0.15])
+            with c1:
+                new_name_base = st.text_input(
+                    "새 파일 이름",
+                    value=filename.removesuffix(".json"),
+                    key=f"text_{key_prefix}_{filename}",
+                    label_visibility="collapsed"
+                )
+            with c2:
+                if st.button("저장", key=f"save_{key_prefix}_{filename}", use_container_width=True, type="primary"):
+                    rename_chat(filename, st.session_state[f"text_{key_prefix}_{filename}"])
+                    st.session_state.editing_chat_file = None
+                    st.rerun()
+            with c3:
+                if st.button("취소", key=f"cancel_{key_prefix}_{filename}", use_container_width=True):
+                    st.session_state.editing_chat_file = None
+                    st.rerun()
+        else:
+            # 일반 표시 모드 UI
+            c1, c2, c3 = st.columns([0.75, 0.125, 0.125])
+            with c1:
                 is_active_chat = st.session_state.get("current_chat_file") == filename
-                label = f"**{filename}**" if is_active_chat else filename
-                st.markdown(label, unsafe_allow_html=True)
-            with d_col2:
-                if st.button("열기", key=f"load_modal_{filename}", use_container_width=True):
-                    load_chat(filename)
-                    st.session_state.show_all_chats = False
+                button_type = "primary" if is_active_chat else "secondary"
+                if st.button(filename, key=f"load_{key_prefix}_{filename}", use_container_width=True, type=button_type):
+                    if not is_active_chat:
+                        load_chat(filename)
+                        st.session_state.editing_chat_file = None
+                        st.rerun()
+            with c2:
+                if st.button("✏️", key=f"edit_{key_prefix}_{filename}", use_container_width=True, help="이름 변경"):
+                    st.session_state.editing_chat_file = filename
                     st.rerun()
-            with d_col3:
-                if st.button("삭제", key=f"delete_modal_{filename}", use_container_width=True):
+            with c3:
+                if st.button("X", key=f"delete_{key_prefix}_{filename}", use_container_width=True, help=f"{filename} 삭제"):
                     delete_chat(filename)
-                    st.session_state.show_all_chats = False
                     st.rerun()
+
+    # 파일 이름이 아닌 수정 시간을 기준으로 정렬
+    try:
+        saved_chats_paths = [p for p in HISTORY_DIR.glob("*.json")]
+        saved_chats_paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        saved_chats = [p.name for p in saved_chats_paths]
+    except FileNotFoundError:
+        saved_chats = []
+
+    @st.dialog("전체 대화 목록")
+    def show_all_chats_dialog(older_chats_list):
+        st.write(f"총 {len(saved_chats)}개의 대화가 있습니다.")
         
+        items_to_show_count = st.session_state.get("dialog_items_to_show", 10)
+        chats_to_display = older_chats_list[:items_to_show_count]
+
+        for filename in chats_to_display:
+            display_chat_item(filename, key_prefix="dialog")
+
+        st.divider()
+
+        # 다이얼로그 내 '더보기' 버튼
+        if len(older_chats_list) > items_to_show_count:
+            if st.button("더보기", use_container_width=True):
+                st.session_state.dialog_items_to_show += 10
+                st.rerun()
+
         if st.button("닫기", use_container_width=True, type="primary"):
             st.session_state.show_all_chats = False
+            st.session_state.editing_chat_file = None
             st.rerun()
 
     if not saved_chats:
@@ -545,44 +642,80 @@ with st.sidebar:
 
         # 최근 10개 대화 목록 표시
         for filename in recent_chats:
-            col1, col2 = st.columns([0.85, 0.15])
-            with col1:
-                is_active_chat = st.session_state.get("current_chat_file") == filename
-                button_type = "primary" if is_active_chat else "secondary"
-                if st.button(filename, key=f"load_recent_{filename}", use_container_width=True, type=button_type):
-                    if not is_active_chat:
-                        load_chat(filename)
-                        st.rerun()
-            with col2:
-                if st.button("X", key=f"delete_recent_{filename}", use_container_width=True, help=f"{filename} 삭제"):
-                    delete_chat(filename)
-                    st.rerun()
+            display_chat_item(filename, key_prefix="recent")
 
         # '더 보기' 버튼
         if older_chats:
             if st.button("더 보기...", use_container_width=True):
                 st.session_state.show_all_chats = True
+                # 다이얼로그를 열 때마다 표시할 아이템 수를 초기화
+                st.session_state.dialog_items_to_show = 10
+                st.rerun()
 
-    # 세션 상태에 따라 다이얼로그 함수를 호출합니다.
     if st.session_state.get("show_all_chats"):
-        show_all_chats_dialog()
-    
+        older_chats = saved_chats[10:]
+        show_all_chats_dialog(older_chats)
+    # <<< [수정] 대화 목록 관리 로직 전체 변경 끝 >>>
+
+    # 저장된 대화 파일 목록을 최신순으로 정렬
     # saved_chats = sorted([f for f in os.listdir(HISTORY_DIR) if f.endswith(".json")], reverse=True)
+
+    # # 다이얼로그를 표시할 함수를 데코레이터와 함께 정의합니다.
+    # @st.dialog("전체 대화 목록")
+    # def show_all_chats_dialog():
+    #     st.write(f"총 {len(saved_chats)}개의 대화가 있습니다.")
+    #     # 모달 내에서 전체 대화 목록 표시
+    #     for filename in saved_chats:
+    #         d_col1, d_col2, d_col3 = st.columns([0.7, 0.15, 0.15])
+    #         with d_col1:
+    #             is_active_chat = st.session_state.get("current_chat_file") == filename
+    #             label = f"**{filename}**" if is_active_chat else filename
+    #             st.markdown(label, unsafe_allow_html=True)
+    #         with d_col2:
+    #             if st.button("열기", key=f"load_modal_{filename}", use_container_width=True):
+    #                 load_chat(filename)
+    #                 st.session_state.show_all_chats = False
+    #                 st.rerun()
+    #         with d_col3:
+    #             if st.button("삭제", key=f"delete_modal_{filename}", use_container_width=True):
+    #                 delete_chat(filename)
+    #                 st.session_state.show_all_chats = False
+    #                 st.rerun()
+        
+    #     if st.button("닫기", use_container_width=True, type="primary"):
+    #         st.session_state.show_all_chats = False
+    #         st.rerun()
+
     # if not saved_chats:
     #     st.write("저장된 대화가 없습니다.")
-    # for filename in saved_chats:
-    #     col1, col2 = st.columns([0.85, 0.15])
-    #     with col1:
-    #         is_active_chat = st.session_state.get("current_chat_file") == filename
-    #         button_type = "primary" if is_active_chat else "secondary"
-    #         if st.button(filename, key=f"load_{filename}", use_container_width=True, type=button_type):
-    #             if not is_active_chat:
-    #                 load_chat(filename)
+    # else:
+    #     recent_chats = saved_chats[:10]
+    #     older_chats = saved_chats[10:]
+
+    #     # 최근 10개 대화 목록 표시
+    #     for filename in recent_chats:
+    #         col1, col2 = st.columns([0.85, 0.15])
+    #         with col1:
+    #             is_active_chat = st.session_state.get("current_chat_file") == filename
+    #             button_type = "primary" if is_active_chat else "secondary"
+    #             if st.button(filename, key=f"load_recent_{filename}", use_container_width=True, type=button_type):
+    #                 if not is_active_chat:
+    #                     load_chat(filename)
+    #                     st.rerun()
+    #         with col2:
+    #             if st.button("X", key=f"delete_recent_{filename}", use_container_width=True, help=f"{filename} 삭제"):
+    #                 delete_chat(filename)
     #                 st.rerun()
-    #     with col2:
-    #         if st.button("X", key=f"delete_{filename}", use_container_width=True, help=f"{filename} 삭제"):
-    #             delete_chat(filename)
-    #             st.rerun()
+
+    #     # '더 보기' 버튼
+    #     if older_chats:
+    #         if st.button("더 보기...", use_container_width=True):
+    #             st.session_state.show_all_chats = True
+
+    # # 세션 상태에 따라 다이얼로그 함수를 호출합니다.
+    # if st.session_state.get("show_all_chats"):
+    #     show_all_chats_dialog()
+    
 
 # --- 메인 채팅 인터페이스 ---
 if "messages" not in st.session_state:
