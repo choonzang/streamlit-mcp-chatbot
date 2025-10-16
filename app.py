@@ -5,6 +5,7 @@ import os
 import json
 import time
 import asyncio
+import shutil
 from dotenv import load_dotenv
 from typing import List, Dict, AsyncGenerator
 from datetime import datetime
@@ -40,9 +41,8 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 # -----------------------------------------------------------------------------
 
 # --- 상수 및 전역 변수 설정 ---
-MCP_CONFIG_FILE = "mcp.json"
-HISTORY_DIR = Path("chat_histories")
-HISTORY_DIR.mkdir(exist_ok=True) # 대화 기록 저장 폴더 생성
+BASE_HISTORY_DIR = Path("chat_histories")
+BASE_HISTORY_DIR.mkdir(exist_ok=True) # 기본 대화 기록 저장 폴더 생성
 
 global selected_category
 global selected_item
@@ -56,14 +56,27 @@ llm_options = {
 #'claude-opus-4-20250514'
 
 # --- 헬퍼 함수 ---
-# <<< [수정] 토큰 계산 헬퍼 함수 추가 시작 >>>
+def get_user_history_dir() -> Path:
+    """로그인된 사용자의 대화 기록 폴더 경로를 반환합니다."""
+    if st.session_state.get("authenticated"):
+        username = st.session_state.get("username", "default")
+        user_dir = BASE_HISTORY_DIR / username
+        user_dir.mkdir(exist_ok=True)
+        return user_dir
+    return BASE_HISTORY_DIR
+
+def get_mcp_config_file() -> str:
+    """로그인된 사용자의 mcp.json 파일 경로를 반환합니다."""
+    if st.session_state.get("authenticated"):
+        username = st.session_state.get("username", "default")
+        return f"mcp_{username}.json"
+    return "mcp.json"
+
 def count_tokens(text: str, model: str = "gpt-4") -> int:
     """주어진 텍스트의 토큰 수를 계산합니다."""
     try:
-        # 모델에 맞는 인코딩 방식을 가져옵니다.
         encoding = tiktoken.encoding_for_model(model)
     except KeyError:
-        # 모델을 찾을 수 없을 경우 기본 인코딩을 사용합니다.
         encoding = tiktoken.get_encoding("cl100k_base")
     return len(encoding.encode(text))
 
@@ -77,7 +90,6 @@ def generate_filename_with_timestamp(prefix="chat_", extension="json"):
         filename = f"{timestamp_str}.{extension}"
     return filename
 
-# @st.cache_resource
 def get_llm():
     """LLM 모델을 초기화하고 캐시합니다."""
     if selected_category == 'Claude':
@@ -90,20 +102,31 @@ def get_llm():
         llm = ChatOpenAI(model="o4-mini", temperature=0,  max_tokens=8000)
     return llm
 
-# @st.cache_data
 def load_mcp_config():
-    """mcp.json 설정 파일을 로드하고 캐시합니다."""
-    with open(MCP_CONFIG_FILE, "r", encoding="utf-8") as f:
+    """사용자별 mcp.json 설정 파일을 로드하고 캐시합니다."""
+    config_file = get_mcp_config_file()
+    if not os.path.exists(config_file):
+        # 사용자별 설정 파일이 없으면 기본 mcp.json으로 생성
+        if os.path.exists("mcp.json"):
+            shutil.copy("mcp.json", config_file)
+            st.toast(f"'{config_file}'이(가) 없어 기본 설정으로 생성합니다.")
+        else:
+            # 기본 파일도 없으면 빈 설정으로 생성
+            with open(config_file, "w", encoding="utf-8") as f:
+                json.dump({"mcpServers": {}}, f, indent=2, ensure_ascii=False)
+            st.toast(f"'{config_file}'이(가) 없어 빈 설정 파일로 생성합니다.")
+
+    with open(config_file, "r", encoding="utf-8") as f:
         return json.load(f)
 
 def save_mcp_config(config):
-    """MCP 서버 설정을 mcp.json 파일에 저장합니다."""
-    with open(MCP_CONFIG_FILE, 'w', encoding='utf-8') as f:
+    """MCP 서버 설정을 사용자별 mcp.json 파일에 저장합니다."""
+    with open(get_mcp_config_file(), 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
 
-# <<< [추가] 파일명 변경 헬퍼 함수 시작 >>>
 def rename_chat(old_filename: str, new_filename_base: str):
     """대화 파일의 이름을 변경하고, 중복 시 숫자를 붙여 처리합니다."""
+    HISTORY_DIR = get_user_history_dir()
     clean_base_name = new_filename_base.strip()
     if not clean_base_name:
         st.error("파일 이름은 비워둘 수 없습니다.")
@@ -118,38 +141,30 @@ def rename_chat(old_filename: str, new_filename_base: str):
 
     final_path = new_path
     final_filename = new_filename
-    
-    # 파일명이 이미 존재하는 경우, 중복되지 않는 새 이름을 찾습니다.
+
     if final_path.exists():
         st.info(f"'{new_filename}' 파일이 이미 존재하여, 뒤에 숫자를 붙여 저장합니다.")
-        
         counter = 1
         while True:
-            # '기존이름 (1).json', '기존이름 (2).json' ... 형식으로 새 이름 생성
             unique_base_name = f"{clean_base_name} ({counter})"
             unique_filename = f"{unique_base_name}.json"
             unique_path = HISTORY_DIR / unique_filename
-            
             if not unique_path.exists():
                 final_path = unique_path
                 final_filename = unique_filename
-                break # 유니크한 이름을 찾았으므로 루프 종료
-            
+                break
             counter += 1
 
     try:
         old_path.rename(final_path)
-        # 사용자에게 최종적으로 변경된 파일명을 알려줍니다.
         st.toast(f"'{old_filename}'을 '{final_filename}'(으)로 변경했습니다.")
-        
         if st.session_state.get("current_chat_file") == old_filename:
             st.session_state.current_chat_file = final_filename
-            
     except Exception as e:
         st.error(f"파일 이름 변경 중 오류 발생: {e}")
-# <<< [수정] 파일명 변경 및 중복 처리 로직 강화 끝 >>>
 
-# --- 핵심 로직 함수 ---
+# --- 핵심 로직 함수 (기존과 동일하여 생략) ---
+# ... (select_mcp_servers, process_query 함수는 여기에 그대로 유지됩니다) ...
 async def select_mcp_servers(query: str, servers_config: Dict) -> List[str]:
     """사용자 질의에 기반하여 사용할 MCP 서버를 LLM을 통해 선택합니다."""
     llm = get_llm()
@@ -182,45 +197,28 @@ async def select_mcp_servers(query: str, servers_config: Dict) -> List[str]:
     selected = [s.strip() for s in response.content.split(',') if s.strip() and s.strip().lower() != 'none']
     return selected
 
-# (★★★★★ 로직 수정 ★★★★★)
 async def process_query(query: str, chat_history: List) -> AsyncGenerator[str, None]:
     """
     사용자 질의를 받아 서버 선택, 에이전트 생성 및 실행의 전체 과정을 처리합니다.
-    'cancel scope' 오류를 해결하기 위해 단일 에이전트 실행 방식을 ainvoke로 변경합니다.
     """
-
-    # <<< [수정] 대화 기록 관리 로직 시작 >>>
-    MAX_HISTORY_TOKENS = 4096  # LLM에 전달할 최대 히스토리 토큰 수 제한
-
+    MAX_HISTORY_TOKENS = 4096
     history_for_llm = []
     current_tokens = 0
-
-    # 전체 대화 기록을 최신순으로 순회하며 토큰 수를 확인
     for message in reversed(chat_history):
         message_content = message.content
-        # 현재 메시지의 토큰 수를 계산
         message_tokens = count_tokens(message_content)
-
-        # 이 메시지를 추가하면 최대 토큰 수를 넘는지 확인
         if current_tokens + message_tokens > MAX_HISTORY_TOKENS:
-            # 넘는다면 더 이상 이전 기록을 추가하지 않고 종료
             break
-
-        # 토큰 수 제한을 넘지 않으면 기록에 추가 (원본 순서를 위해 맨 앞에 삽입)
         history_for_llm.insert(0, message)
         current_tokens += message_tokens
-    # <<< [수정] 대화 기록 관리 로직 끝 >>>
 
     mcp_config = load_mcp_config()["mcpServers"]
     llm = get_llm()
-    #agent_input = {"messages": chat_history + [HumanMessage(content=query)]}
     agent_input = {"messages": history_for_llm + [HumanMessage(content=query)]}
 
-    # 1. MCP 서버 라우팅
     st.write("`1. MCP 서버 라우팅 중...`")
     selected_server_names = await select_mcp_servers(query, mcp_config)
 
-    # 2. 연결할 MCP 서버가 없을 경우, LLM으로 직접 질의
     if not selected_server_names:
         st.info("✅ LLM이 직접 답변합니다.")
         async for chunk in llm.astream(agent_input["messages"]):
@@ -414,28 +412,69 @@ async def process_query(query: str, chat_history: List) -> AsyncGenerator[str, N
         }):
             yield chunk
 
-# --- Streamlit UI 구성 (이하 변경 없음) ---
 
+# --- Streamlit UI 구성 ---
 st.set_page_config(page_title="MCP Client on Streamlit", layout="wide")
 st.title("🤖 MCP Client")
 
-# 1. 인증 처리
+# --- 1. 인증 처리 (수정된 로직) ---
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
+localS = LocalStorage()
+
 if not st.session_state.authenticated:
-    password = st.text_input("비밀번호를 입력하세요:", type="password")
+    # 환경변수에서 사용자 정보 로드
+    credentials_str = os.getenv("USER_CREDENTIALS", "")
+    credentials = {}
+    if credentials_str:
+        for pair in credentials_str.split(','):
+            try:
+                username, password = pair.strip().split('|', 1)
+                credentials[username] = password
+            except ValueError:
+                st.error("USER_CREDENTIALS 환경 변수 형식이 잘못되었습니다. 'id|pw,id2|pw2' 형식을 사용하세요.")
+                st.stop()
+    
+    if not credentials:
+        st.error("로그인 정보가 설정되지 않았습니다. USER_CREDENTIALS 환경 변수를 확인하세요.")
+        st.stop()
+
+    st.subheader("로그인")
+    
+    # localStorage에서 저장된 사용자 ID 불러오기
+    remembered_username = localS.getItem("remembered_username") or ""
+    
+    # 저장된 아이디가 있으면 체크박스를 기본적으로 선택 상태로 둡니다.
+    is_checked_by_default = remembered_username != ""
+    
+    username = st.text_input("사용자 아이디", value=remembered_username)
+    remember_id = st.checkbox("아이디 저장", value=is_checked_by_default)
+    password = st.text_input("비밀번호", type="password")
+    
     if st.button("로그인"):
-        if password == os.getenv("APP_PASSWORD"):
+        if username in credentials and credentials[username] == password:
             st.session_state.authenticated = True
+            st.session_state.username = username
+            
+            # '아이디 저장' 체크박스 상태에 따라 localStorage에 저장 또는 삭제
+            if remember_id:
+                localS.setItem("remembered_username", username)
+            else:
+                localS.setItem("remembered_username", "") # 저장된 아이디 삭제
+
+            # (★★★ 수정된 부분 ★★★)
+            # localStorage가 값을 설정할 수 있도록 아주 짧은 지연 시간을 추가합니다.
+            time.sleep(0.1)
+            
             st.rerun()
         else:
-            st.error("비밀번호가 일치하지 않습니다.")
+            st.error("아이디 또는 비밀번호가 일치하지 않습니다.")
     st.stop()
 
-# 2. 메인 애플리케이션 (인증 후)
+# --- 2. 메인 애플리케이션 (인증 후) ---
 with st.sidebar:
-    st.header("메뉴")
+    st.header(f"환영합니다, {st.session_state.username}님!")
     if st.button("로그아웃"):
         for key in list(st.session_state.keys()):
             del st.session_state[key]
@@ -446,18 +485,21 @@ with st.sidebar:
         st.session_state.current_chat_file = None
 
     def auto_save_chat():
+        HISTORY_DIR = get_user_history_dir()
         if st.session_state.get("current_chat_file") and st.session_state.get("messages"):
             save_path = HISTORY_DIR / st.session_state.current_chat_file
             with open(save_path, "w", encoding="utf-8") as f:
                 json.dump(st.session_state.messages, f, ensure_ascii=False, indent=2)
 
     def load_chat(filename: str):
+        HISTORY_DIR = get_user_history_dir()
         load_path = HISTORY_DIR / filename
         with open(load_path, "r", encoding="utf-8") as f:
             st.session_state.messages = json.load(f)
         st.session_state.current_chat_file = filename
 
     def delete_chat(filename: str):
+        HISTORY_DIR = get_user_history_dir()
         if st.session_state.get("current_chat_file") == filename:
             start_new_chat()
         file_to_delete = HISTORY_DIR / filename
@@ -467,50 +509,25 @@ with st.sidebar:
 
     st.button("새로운 채팅 열기", on_click=start_new_chat, use_container_width=True)
     st.divider()
-    localS = LocalStorage()
 
-    #localStorage에서 이전에 저장된 값 불러오기
+    # LLM 관리 UI (기존과 동일)
     saved_model = localS.getItem("selected_model")
-    if saved_model:
-        saved_category =  saved_model[0]
-        saved_item = saved_model[1]
-    else:
-        saved_category = ""
-        saved_item = ""
-
-    #1. 첫 번째 selectbox(카테고리)의 기본 인덱스 설정
+    saved_category = saved_model[0] if saved_model else ""
+    saved_item = saved_model[1] if saved_model else ""
+    
     categories = list(llm_options.keys())
-    #2. 저장된 값이 있으면 해당 값의 인덱스를, 없으면 0을 기본값으로 사용
     category_index = categories.index(saved_category) if saved_category in categories else 0
-
-    st.header("LLM 관리")  
-
-    # 카테고리 selectbox 생성
-    selected_category = st.selectbox(
-        "LLM를 선택하세요:",
-        categories,
-        index=category_index
-    )
-
-    # 3. 두 번째 selectbox(모델)의 기본 인덱스 설정
+    
+    st.header("LLM 관리")
+    selected_category = st.selectbox("LLM를 선택하세요:", categories, index=category_index)
+    
     model_options = llm_options[selected_category]
-    # 저장된 모델이 현재 선택된 카테고리 내에 있는지 확인 후 인덱스 설정
     item_index = model_options.index(saved_item) if saved_item in model_options else 0
-
-    # 모델 selectbox 생성
-    selected_item = st.selectbox(
-        f"{selected_category} 중에서 선택하세요:",
-        model_options,
-        index=item_index
-    )
-    # 4. 현재 선택된 값을 localStorage에 저장
-    # 사용자가 값을 변경하면 Streamlit이 스크립트를 재실행하므로, 
-    # 이 코드는 항상 최신 선택 값을 저장하게 됩니다.
+    selected_item = st.selectbox(f"{selected_category} 중에서 선택하세요:", model_options, index=item_index)
     localS.setItem("selected_model", [selected_category,selected_item])
-   
 
     st.divider()
-    st.header("MCP 서버 관리")
+    st.header(f"MCP 서버 관리 ({st.session_state.username})")
     mcp_config = load_mcp_config()
     with st.expander("서버 목록 보기/관리"):
         st.json(mcp_config, expanded=False)
@@ -556,10 +573,11 @@ with st.sidebar:
     st.divider()
     st.header("저장된 대화")
 
-    # <<< [수정] 대화 목록 관리 로직 전체 변경 시작 >>>
+    # 대화 목록 관리 UI (기존과 동일, 경로만 수정됨)
+    HISTORY_DIR = get_user_history_dir()
     if "editing_chat_file" not in st.session_state:
         st.session_state.editing_chat_file = None
-
+    # ... (display_chat_item, show_all_chats_dialog 등 대화 목록 UI 함수는 기존과 동일) ...
     def display_chat_item(filename: str, key_prefix: str):
         """대화 목록 아이템을 표시하고 수정/삭제 UI를 제공하는 함수"""
         is_editing = st.session_state.get("editing_chat_file") == filename
@@ -603,7 +621,6 @@ with st.sidebar:
                     delete_chat(filename)
                     st.rerun()
 
-    # 파일 이름이 아닌 수정 시간을 기준으로 정렬
     try:
         saved_chats_paths = [p for p in HISTORY_DIR.glob("*.json")]
         saved_chats_paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
@@ -614,108 +631,37 @@ with st.sidebar:
     @st.dialog("전체 대화 목록")
     def show_all_chats_dialog(older_chats_list):
         st.write(f"총 {len(saved_chats)}개의 대화가 있습니다.")
-        
         items_to_show_count = st.session_state.get("dialog_items_to_show", 10)
         chats_to_display = older_chats_list[:items_to_show_count]
-
         for filename in chats_to_display:
             display_chat_item(filename, key_prefix="dialog")
-
         st.divider()
-
-        # 다이얼로그 내 '더보기' 버튼
         if len(older_chats_list) > items_to_show_count:
             if st.button("더보기", use_container_width=True):
                 st.session_state.dialog_items_to_show += 10
                 st.rerun()
-
         if st.button("닫기", use_container_width=True, type="primary"):
             st.session_state.show_all_chats = False
             st.session_state.editing_chat_file = None
             st.rerun()
-
+    
     if not saved_chats:
         st.write("저장된 대화가 없습니다.")
     else:
         recent_chats = saved_chats[:10]
         older_chats = saved_chats[10:]
-
-        # 최근 10개 대화 목록 표시
         for filename in recent_chats:
             display_chat_item(filename, key_prefix="recent")
-
-        # '더 보기' 버튼
         if older_chats:
             if st.button("더 보기...", use_container_width=True):
                 st.session_state.show_all_chats = True
-                # 다이얼로그를 열 때마다 표시할 아이템 수를 초기화
                 st.session_state.dialog_items_to_show = 10
                 st.rerun()
-
+    
     if st.session_state.get("show_all_chats"):
         older_chats = saved_chats[10:]
         show_all_chats_dialog(older_chats)
-    # <<< [수정] 대화 목록 관리 로직 전체 변경 끝 >>>
 
-    # 저장된 대화 파일 목록을 최신순으로 정렬
-    # saved_chats = sorted([f for f in os.listdir(HISTORY_DIR) if f.endswith(".json")], reverse=True)
-
-    # # 다이얼로그를 표시할 함수를 데코레이터와 함께 정의합니다.
-    # @st.dialog("전체 대화 목록")
-    # def show_all_chats_dialog():
-    #     st.write(f"총 {len(saved_chats)}개의 대화가 있습니다.")
-    #     # 모달 내에서 전체 대화 목록 표시
-    #     for filename in saved_chats:
-    #         d_col1, d_col2, d_col3 = st.columns([0.7, 0.15, 0.15])
-    #         with d_col1:
-    #             is_active_chat = st.session_state.get("current_chat_file") == filename
-    #             label = f"**{filename}**" if is_active_chat else filename
-    #             st.markdown(label, unsafe_allow_html=True)
-    #         with d_col2:
-    #             if st.button("열기", key=f"load_modal_{filename}", use_container_width=True):
-    #                 load_chat(filename)
-    #                 st.session_state.show_all_chats = False
-    #                 st.rerun()
-    #         with d_col3:
-    #             if st.button("삭제", key=f"delete_modal_{filename}", use_container_width=True):
-    #                 delete_chat(filename)
-    #                 st.session_state.show_all_chats = False
-    #                 st.rerun()
-        
-    #     if st.button("닫기", use_container_width=True, type="primary"):
-    #         st.session_state.show_all_chats = False
-    #         st.rerun()
-
-    # if not saved_chats:
-    #     st.write("저장된 대화가 없습니다.")
-    # else:
-    #     recent_chats = saved_chats[:10]
-    #     older_chats = saved_chats[10:]
-
-    #     # 최근 10개 대화 목록 표시
-    #     for filename in recent_chats:
-    #         col1, col2 = st.columns([0.85, 0.15])
-    #         with col1:
-    #             is_active_chat = st.session_state.get("current_chat_file") == filename
-    #             button_type = "primary" if is_active_chat else "secondary"
-    #             if st.button(filename, key=f"load_recent_{filename}", use_container_width=True, type=button_type):
-    #                 if not is_active_chat:
-    #                     load_chat(filename)
-    #                     st.rerun()
-    #         with col2:
-    #             if st.button("X", key=f"delete_recent_{filename}", use_container_width=True, help=f"{filename} 삭제"):
-    #                 delete_chat(filename)
-    #                 st.rerun()
-
-    #     # '더 보기' 버튼
-    #     if older_chats:
-    #         if st.button("더 보기...", use_container_width=True):
-    #             st.session_state.show_all_chats = True
-
-    # # 세션 상태에 따라 다이얼로그 함수를 호출합니다.
-    # if st.session_state.get("show_all_chats"):
-    #     show_all_chats_dialog()
-    
 
 # --- 메인 채팅 인터페이스 ---
 if "messages" not in st.session_state:
@@ -738,7 +684,6 @@ st.markdown(
     </style>
     """,unsafe_allow_html=True
 )
-# if prompt := st.chat_input("질문을 입력하세요."):
 prompt = st.chat_input("질문을 입력하세요.")
 if prompt:
     if not st.session_state.get("current_chat_file"):
@@ -753,6 +698,10 @@ if prompt:
             HumanMessage(content=m['content']) if m['role'] == 'user' else AIMessage(content=m['content'])
             for m in st.session_state.messages[:-1]
         ]
+        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+        # 핵심 로직 함수(process_query)가 생략되었으므로,
+        # 원본 코드의 process_query 함수 전체를 위에 붙여넣어야 정상 동작합니다.
+        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
         response = st.write_stream(process_query(prompt, history))
         st.badge("Answer by "+selected_item+"", icon=":material/check:", color="green")
 
