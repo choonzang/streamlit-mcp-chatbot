@@ -694,9 +694,10 @@ with st.sidebar:
 
     st.divider()
     st.header("이미지 생성 설정")
-    image_gen_model = st.selectbox("이미지 생성 모델 선택:", ["DALL-E 3", "Google Nano Banana"], index=0)
+    image_gen_model = st.selectbox("이미지 생성 모델 선택:", ["Google Nano Banana","DALL-E 3"], index=0)
     if "image_gen_model" not in st.session_state:
-        st.session_state.image_gen_model = "DALL-E 3"
+        #st.session_state.image_gen_model = "DALL-E 3"
+        st.session_state.image_gen_model = "Google Nano Banana"
     st.session_state.image_gen_model = image_gen_model
 
 
@@ -883,7 +884,7 @@ st.markdown(
     <style>
     @media(max-width:1024px){
         .stBottom{
-        bottom:60px;
+        /*bottom:60px;*/
         }
     }
     /* 오디오 플레이어 스타일 조정 */
