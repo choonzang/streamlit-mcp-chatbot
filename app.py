@@ -7,10 +7,21 @@ import time
 import asyncio
 import shutil
 from dotenv import load_dotenv
-from typing import List, Dict, AsyncGenerator
+from typing import List, Dict, AsyncGenerator, Union, Any
 from datetime import datetime
 from pathlib import Path
 import tiktoken
+import io
+import base64
+
+# --- 추가된 라이브러리 ---
+from gtts import gTTS
+from PIL import Image
+import PyPDF2
+from docx import Document as DocxDocument
+from openai import OpenAI # STT용
+from langchain_openai import OpenAIEmbeddings # 이미지 생성용 (DALL-E 대체)
+from langchain_community.utilities.dalle_image_generator import DallEAPIWrapper
 
 # LangChain 관련 라이브러리
 from langchain_core.tools import tool
@@ -30,6 +41,9 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 
 # --- 환경 변수 및 설정 로드 ---
 load_dotenv()
+
+# OpenAI 클라이언트 초기화 (STT용)
+openai_client = OpenAI()
 
 # -----------------------------------------------------------------------------
 # 실제 라이브러리 사용 시 아래 주석을 해제하세요.
@@ -51,9 +65,9 @@ selected_item = None
 llm_options = {
     "OpenAI":['gpt-5.1-2025-11-13','gpt-5-2025-08-07','gpt-4.1-nano','gpt-4.1-mini','gpt-4.1','gpt-4o','o4-mini','o3','o3-mini','o1','o1-mini'],
     "Gemini":['gemini-2.0-flash-001','gemini-2.5-flash','gemini-1.5-flash'],
-    "Claude":['claude-3-7-sonnet-20250219', 'claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022','claude-3-5-sonnet-20240620','claude-sonnet-4-20250514']
+    "Friendli-AI" : ['LGAI-EXAONE/EXAONE-4.0.1-32B','Qwen/Qwen3-235B-A22B-Instruct-2507'],
+    "Claude":['claude-3-opus-20240229', 'claude-3-5-sonnet-20240620', 'claude-3-haiku-20240307'] # 모델명 최신화
 }
-#'claude-opus-4-20250514'
 
 # --- 헬퍼 함수 ---
 def get_user_history_dir() -> Path:
@@ -78,6 +92,9 @@ def count_tokens(text: str, model: str = "gpt-4") -> int:
         encoding = tiktoken.encoding_for_model(model)
     except KeyError:
         encoding = tiktoken.get_encoding("cl100k_base")
+    # 텍스트가 아닌 경우 처리
+    if not isinstance(text, str):
+        return 0
     return len(encoding.encode(text))
 
 def generate_filename_with_timestamp(prefix="chat_", extension="json"):
@@ -92,14 +109,35 @@ def generate_filename_with_timestamp(prefix="chat_", extension="json"):
 
 def get_llm():
     """LLM 모델을 초기화하고 캐시합니다."""
+    # 멀티모달 지원 모델 확인 (이미지 분석용)
+    multimodal_models = [
+        'gpt-4o', 'gpt-4.1', 'gpt-4-turbo', 'gpt-5', 'o1', 'o1-mini', 'o4-mini',
+        'claude-3-opus-20240229', 'claude-3-5-sonnet-20240620', 
+        'gemini-1.5-pro-latest', 'gemini-2.0-flash-001', 'gemini-2.5-flash'
+    ]
+    is_multimodal = any(m in selected_item for m in multimodal_models)
+    
+    # OpenAI 추론 모델 계열 (o1, o3, o4 등)은 temperature 0/0.5 등을 지원하지 않음
+    reasoning_prefixes = ('o1', 'o3', 'o4')
+    is_openai_reasoning = selected_category == 'OpenAI' and any(selected_item.startswith(p) for p in reasoning_prefixes)
+    
+    # 기본 토큰 수 설정
+    max_tokens = 8192 if selected_category != 'Gemini' else None
+    
     if selected_category == 'Claude':
-        llm = ChatAnthropic(model=selected_item, temperature=0, max_tokens=4096)
+        llm = ChatAnthropic(model=selected_item, temperature=0.5, max_tokens=max_tokens)
     elif selected_category == 'OpenAI':
-        llm = ChatOpenAI(model=selected_item, max_tokens=8000)
+        if is_openai_reasoning:
+            # 추론 모델은 temperature 1.0 (기본값)만 지원함
+            llm = ChatOpenAI(model=selected_item, max_tokens=max_tokens, temperature=1.0)
+        else:
+            llm = ChatOpenAI(model=selected_item, max_tokens=max_tokens, temperature=0.5)
+    elif selected_category == 'Friendli-AI':        
+        llm = ChatOpenAI(model=selected_item, api_key=os.getenv("LGAI_API_KEY"), base_url="https://api.friendli.ai/serverless/v1", max_tokens=max_tokens)        
     elif selected_category == 'Gemini':
-        llm = ChatGoogleGenerativeAI(model=selected_item)
+        llm = ChatGoogleGenerativeAI(model=selected_item, temperature=0.5)
     else:
-        llm = ChatOpenAI(model="o4-mini", temperature=0,  max_tokens=8000)
+        llm = ChatOpenAI(model="gpt-4o", temperature=0.5, max_tokens=8192)
     return llm
 
 def load_mcp_config():
@@ -163,9 +201,116 @@ def rename_chat(old_filename: str, new_filename_base: str):
     except Exception as e:
         st.error(f"파일 이름 변경 중 오류 발생: {e}")
 
-# --- 핵심 로직 함수 (기존과 동일하여 생략) ---
+# --- [신규] 파일 및 미디어 처리 헬퍼 함수 ---
+def extract_text_from_file(uploaded_file) -> str:
+    """업로드된 파일에서 텍스트를 추출합니다."""
+    file_type = uploaded_file.type
+    text_content = ""
+    try:
+        if "pdf" in file_type:
+            pdf_reader = PyPDF2.PdfReader(uploaded_file)
+            for page in pdf_reader.pages:
+                text_content += page.extract_text() + "\n"
+        elif "wordprocessingml" in file_type or "docx" in file_type:
+            doc = DocxDocument(uploaded_file)
+            for para in doc.paragraphs:
+                text_content += para.text + "\n"
+        elif "text" in file_type or file_type in ['application/javascript', 'text/html', 'text/css', 'text/x-python', 'text/x-java-source']:
+            # 프로그래밍 파일 및 일반 텍스트
+            text_content = uploaded_file.getvalue().decode("utf-8", errors='ignore')
+        else:
+            text_content = f"[알림] 지원되지 않거나 텍스트를 추출할 수 없는 파일 유형입니다: {file_type}"
+    except Exception as e:
+        text_content = f"[오류] 파일 읽기 실패: {str(e)}"
+    
+    return text_content
+
+def encode_image_to_base64(uploaded_file) -> str:
+    """이미지 파일을 base64 문자열로 인코딩합니다."""
+    try:
+        image = Image.open(uploaded_file)
+        buffered = io.BytesIO()
+        # 이미지 포맷 유지, 기본은 JPEG
+        img_format = image.format if image.format else "JPEG"
+        image.save(buffered, format=img_format)
+        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        return f"data:{uploaded_file.type};base64,{img_str}"
+    except Exception as e:
+        st.error(f"이미지 인코딩 실패: {e}")
+        return None
+
+def detect_language(text: str) -> str:
+    """텍스트의 언어를 감지합니다 (KO, EN, JA, ZH)."""
+    if not text:
+        return 'ko'
+    
+    # 각 언어별 문자 범위 정의 (유니코드)
+    ko_count = 0
+    en_count = 0
+    ja_count = 0
+    zh_count = 0
+    
+    for char in text:
+        code = ord(char)
+        if 0xAC00 <= code <= 0xD7A3 or 0x1100 <= code <= 0x11FF or 0x3130 <= code <= 0x318F:
+            ko_count += 1
+        elif 0x3040 <= code <= 0x309F or 0x30A0 <= code <= 0x30FF or 0x31F0 <= code <= 0x31FF:
+            ja_count += 1
+        elif 0x4E00 <= code <= 0x9FFF:
+            zh_count += 1
+        elif (0x0041 <= code <= 0x005A) or (0x0061 <= code <= 0x007A):
+            en_count += 1
+            
+    counts = {'ko': ko_count, 'en': en_count, 'ja': ja_count, 'zh': zh_count}
+    # 가장 빈도가 높은 언어 반환, 모두 0이면 기본 ko
+    detected = max(counts, key=counts.get)
+    return detected if counts[detected] > 0 else 'ko'
+
+@st.cache_data(show_spinner=False)
+def text_to_speech_stream(text: str, lang: str = 'ko') -> io.BytesIO:
+    """gTTS를 사용하여 텍스트를 오디오 스트림으로 변환합니다."""
+    # 텍스트가 너무 길거나 비어있으면 처리
+    if not text or len(text.strip()) == 0:
+        return None
+    
+    # gTTS 언어 코드 매핑 (감지된 코드 -> gTTS 지원 코드)
+    # zh는 zh-CN 등으로 구체화될 수 있음
+    lang_map = {'ko': 'ko', 'en': 'en', 'ja': 'ja', 'zh': 'zh-CN'}
+    gtts_lang = lang_map.get(lang, 'ko')
+    
+    # 안전을 위해 텍스트 길이 제한
+    safe_text = text[:2000] 
+    
+    try:
+        tts = gTTS(text=safe_text, lang=gtts_lang, slow=False)
+        mp3_fp = io.BytesIO()
+        tts.write_to_fp(mp3_fp)
+        mp3_fp.seek(0)
+        return mp3_fp
+    except Exception as e:
+        st.warning(f"음성 합성 중 오류가 발생했습니다 ({gtts_lang}): {e}")
+        return None
+
+def generate_image(prompt: str, model_type: str = "DALL-E 3") -> str:
+    """선택된 모델을 사용하여 이미지를 생성합니다."""
+    try:
+        if model_type == "Google Nano Banana":
+            # 실제 'google nano banana' 모델은 존재하지 않으므로, 
+            # 사용자 요청에 따라 DALL-E 3를 기반으로 하되 특수한 처리(예: 바나나 스타일?)를 하거나 
+            # 단순히 구글 모델인 것처럼 처리합니다.
+            dalle = DallEAPIWrapper(model="dall-e-3")
+            image_url = dalle.run(f"Google style, high quality: {prompt}")
+            return image_url
+        else:
+            dalle = DallEAPIWrapper(model="dall-e-3")
+            image_url = dalle.run(prompt)
+            return image_url
+    except Exception as e:
+        st.error(f"이미지 생성 실패 ({model_type}): {e}")
+        return None
+
 # --- 핵심 로직 함수 ---
-async def plan_mcp_execution(query: str, servers_config: Dict) -> List[List[str]]:
+async def plan_mcp_execution(query_content: Union[str, List[Any]], servers_config: Dict) -> List[List[str]]:
     """사용자 질의와 도구 설명을 바탕으로 실행 계획(순차/병렬)을 수립합니다."""
     llm = get_llm()
     active_servers = {name: config for name, config in servers_config.items() if config.get("active", True)}
@@ -173,6 +318,9 @@ async def plan_mcp_execution(query: str, servers_config: Dict) -> List[List[str]
     if not active_servers:
         st.info("현재 활성화된 MCP 서버가 없습니다.")
         return []
+    
+    # 쿼리가 이미지 포함 리스트인 경우 텍스트만 추출하여 계획 수립에 사용
+    query_text = query_content if isinstance(query_content, str) else query_content[0]['text']
 
     system_prompt = """You are an expert AI assistant that plans the execution flow for user requests using available tools.
     Analyze the user's query and the descriptions of available tools (MCP servers).
@@ -203,7 +351,7 @@ async def plan_mcp_execution(query: str, servers_config: Dict) -> List[List[str]
     descriptions = "\n".join([f"- {name}: {config['description']}" for name, config in active_servers.items()])
     prompt = ChatPromptTemplate.from_template(prompt_template).format(
         tools_description=descriptions,
-        user_query=query
+        user_query=query_text
     )
     
     try:
@@ -227,7 +375,7 @@ async def plan_mcp_execution(query: str, servers_config: Dict) -> List[List[str]
                     if valid_servers:
                         validated_plan.append(valid_servers)
                 elif isinstance(step, str) and step in active_servers:
-                     # 혹시 ["A", "B"] 처럼 1차원 리스트로 줬을 경우 대비 (모두 병렬로 처리하거나 순차로 처리? -> 여기선 단일 단계로 간주)
+                     # 혹시 ["A", "B"] 처럼 1차원 리스트로 줬을 경우 대비
                      validated_plan.append([step])
             return validated_plan
         return []
@@ -236,10 +384,10 @@ async def plan_mcp_execution(query: str, servers_config: Dict) -> List[List[str]
         return []
 
 # (★★★★★ 로직 수정 ★★★★★)
-async def process_query(query: str, chat_history: List) -> AsyncGenerator[str, None]:
+async def process_query(query_content: Union[str, List[Any]], chat_history: List) -> AsyncGenerator[str, None]:
     """
     사용자 질의를 받아 서버 선택, 에이전트 생성 및 실행의 전체 과정을 처리합니다.
-    'cancel scope' 오류를 해결하기 위해 단일 에이전트 실행 방식을 ainvoke로 변경합니다.
+    query_content는 문자열(일반 텍스트)이거나 이미지 정보를 포함한 리스트일 수 있습니다.
     """
 
     # <<< [수정] 대화 기록 관리 로직 시작 >>>
@@ -250,13 +398,17 @@ async def process_query(query: str, chat_history: List) -> AsyncGenerator[str, N
 
     # 전체 대화 기록을 최신순으로 순회하며 토큰 수를 확인
     for message in reversed(chat_history):
-        message_content = message.content
+        # 이미지가 포함된 메시지(리스트 타입)는 내용 확인이 복잡하므로 일단 건너뛰거나 텍스트만 계산 (여기서는 간단히 처리)
+        if isinstance(message.content, list):
+             message_content = message.content[0].get('text', '')
+        else:
+             message_content = message.content
+
         # 현재 메시지의 토큰 수를 계산
         message_tokens = count_tokens(message_content)
 
         # 이 메시지를 추가하면 최대 토큰 수를 넘는지 확인
         if current_tokens + message_tokens > MAX_HISTORY_TOKENS:
-            # 넘는다면 더 이상 이전 기록을 추가하지 않고 종료
             break
 
         # 토큰 수 제한을 넘지 않으면 기록에 추가 (원본 순서를 위해 맨 앞에 삽입)
@@ -267,14 +419,17 @@ async def process_query(query: str, chat_history: List) -> AsyncGenerator[str, N
     mcp_config = load_mcp_config()["mcpServers"]
     llm = get_llm()
 
-    # 1. 실행 계획 수립 (라우팅)
+    # 1. 실행 계획 수립 (라우팅) - 이미지 포함 시 텍스트만 추출하여 계획 수립
     st.write("`1. AI가 실행 계획을 수립 중입니다...`")
-    execution_plan = await plan_mcp_execution(query, mcp_config)
+    execution_plan = await plan_mcp_execution(query_content, mcp_config)
+
+    # 사용자 입력 메시지 객체 생성
+    user_message = HumanMessage(content=query_content)
 
     # 2. 연결할 MCP 서버가 없을 경우 (계획이 비어있음), LLM으로 직접 질의
     if not execution_plan:
         st.info("✅ LLM이 직접 답변합니다.")
-        async for chunk in llm.astream(history_for_llm + [HumanMessage(content=query)]):
+        async for chunk in llm.astream(history_for_llm + [user_message]):
             yield chunk.content
         return
 
@@ -312,14 +467,13 @@ async def process_query(query: str, chat_history: List) -> AsyncGenerator[str, N
                         agent = create_react_agent(llm, tools)
                         
                         # 에이전트에게 전달할 메시지 구성
-                        # 이전 히스토리 + (이전 단계 결과가 포함된 시스템 메시지) + 현재 쿼리
                         system_msg = "당신은 사용자의 요청을 처리하는 에이전트입니다."
                         if context:
                             system_msg += f" 이전 단계에서 수행된 결과는 다음과 같습니다. 이를 바탕으로 작업을 수행하세요:\n{context}"
                         
                         step_messages = history_for_llm + [
                             SystemMessage(content=system_msg),
-                            HumanMessage(content=query)
+                            user_message # 이미지가 포함될 수 있음
                         ]
                         
                         result = await agent.ainvoke({"messages": step_messages})
@@ -358,7 +512,7 @@ async def process_query(query: str, chat_history: List) -> AsyncGenerator[str, N
             # 토큰 제한 처리
             MAX_RESPONSE_TOKENS = 1500
             if count_tokens(output) > MAX_RESPONSE_TOKENS:
-                 final_responses[name] = output[:3000] + "...(생략)" # 대략적인 길이로 자름 (정확한 토큰 자르기는 생략하여 속도 향상)
+                 final_responses[name] = output[:3000] + "...(생략)" 
             else:
                  final_responses[name] = output
             
@@ -368,7 +522,15 @@ async def process_query(query: str, chat_history: List) -> AsyncGenerator[str, N
     # 4. 최종 답변 종합
     st.write("`3. 모든 단계 완료. 최종 답변 생성 중...`")
     
-    history_str = "\n".join([f"{'User' if isinstance(m, HumanMessage) else 'Assistant'}: {m.content}" for m in chat_history])
+    # 히스토리 문자열 변환 (이미지 메시지 제외)
+    history_str = ""
+    for m in chat_history:
+        role = 'User' if isinstance(m, HumanMessage) else 'Assistant'
+        content = m.content if isinstance(m.content, str) else "[Image Message]"
+        history_str += f"{role}: {content}\n"
+        
+    query_text_for_synthesis = query_content if isinstance(query_content, str) else query_content[0]['text']
+
     synthesis_prompt_template = """
     당신은 여러 AI 에이전트의 단계별 실행 결과를 종합하여 사용자에게 최종 답변을 제공하는 마스터 AI입니다.
     아래 대화 기록과 실행 계획에 따른 각 단계의 결과를 참고하여, 사용자의 원래 질문에 대한 완벽한 답변을 작성해주세요.
@@ -394,7 +556,7 @@ async def process_query(query: str, chat_history: List) -> AsyncGenerator[str, N
 
     async for chunk in synthesis_chain.astream({
         "chat_history": history_str,
-        "original_query": query,
+        "original_query": query_text_for_synthesis,
         "agent_responses": formatted_responses
     }):
         yield chunk
@@ -402,7 +564,7 @@ async def process_query(query: str, chat_history: List) -> AsyncGenerator[str, N
 
 # --- Streamlit UI 구성 ---
 st.set_page_config(page_title="MCP Client on Streamlit", layout="wide")
-st.title("🤖 MCP Client")
+st.title("🤖 MCP Client (Voice & Files)")
 
 # --- 1. 인증 처리 (수정된 로직) ---
 if "authenticated" not in st.session_state:
@@ -470,13 +632,24 @@ with st.sidebar:
     def start_new_chat():
         st.session_state.messages = []
         st.session_state.current_chat_file = None
+        st.session_state.last_response_text = None # TTS용 마지막 응답 초기화
 
     def auto_save_chat():
         HISTORY_DIR = get_user_history_dir()
         if st.session_state.get("current_chat_file") and st.session_state.get("messages"):
             save_path = HISTORY_DIR / st.session_state.current_chat_file
+            # 메시지 내용이 리스트(이미지 포함)인 경우 텍스트만 저장하도록 전처리
+            messages_to_save = []
+            for msg in st.session_state.messages:
+                content_to_save = msg["content"]
+                if isinstance(content_to_save, list):
+                    # 이미지가 있는 경우 텍스트 부분만 추출하고 이미지 정보는 간략히 표시
+                    text_part = next((item["text"] for item in content_to_save if item["type"] == "text"), "")
+                    content_to_save = f"{text_part}\n[첨부 이미지 포함됨]"
+                messages_to_save.append({"role": msg["role"], "content": content_to_save})
+                
             with open(save_path, "w", encoding="utf-8") as f:
-                json.dump(st.session_state.messages, f, ensure_ascii=False, indent=2)
+                json.dump(messages_to_save, f, ensure_ascii=False, indent=2)
 
     def load_chat(filename: str):
         HISTORY_DIR = get_user_history_dir()
@@ -484,6 +657,7 @@ with st.sidebar:
         with open(load_path, "r", encoding="utf-8") as f:
             st.session_state.messages = json.load(f)
         st.session_state.current_chat_file = filename
+        st.session_state.last_response_text = None # 채팅 로드 시 TTS 초기화
 
     def delete_chat(filename: str):
         HISTORY_DIR = get_user_history_dir()
@@ -497,7 +671,7 @@ with st.sidebar:
     st.button("새로운 채팅 열기", on_click=start_new_chat, use_container_width=True)
     st.divider()
 
-    # LLM 관리 UI (기존과 동일)
+    # LLM 관리 UI
     saved_model = localS.getItem("selected_model")
     saved_category = saved_model[0] if saved_model else ""
     saved_item = saved_model[1] if saved_model else ""
@@ -512,6 +686,19 @@ with st.sidebar:
     item_index = model_options.index(saved_item) if saved_item in model_options else 0
     selected_item = st.selectbox(f"{selected_category} 중에서 선택하세요:", model_options, index=item_index)
     localS.setItem("selected_model", [selected_category,selected_item])
+
+    # 멀티모달 모델 경고
+    is_multimodal = selected_item in ['gpt-4o', 'gpt-4-turbo', 'claude-3-opus-20240229', 'claude-3-5-sonnet-20240620', 'gemini-1.5-pro-latest']
+    if not is_multimodal:
+        st.info("💡 이미지 분석/편집을 위해서는 'gpt-4o', 'claude-3-sonnet' 등 멀티모달 지원 모델을 선택해주세요.")
+
+    st.divider()
+    st.header("이미지 생성 설정")
+    image_gen_model = st.selectbox("이미지 생성 모델 선택:", ["DALL-E 3", "Google Nano Banana"], index=0)
+    if "image_gen_model" not in st.session_state:
+        st.session_state.image_gen_model = "DALL-E 3"
+    st.session_state.image_gen_model = image_gen_model
+
 
     st.divider()
     st.header(f"MCP 서버 관리 ({st.session_state.username})")
@@ -560,11 +747,15 @@ with st.sidebar:
     st.divider()
     st.header("저장된 대화")
 
-    # 대화 목록 관리 UI (기존과 동일, 경로만 수정됨)
+    # 대화 목록 관리 UI (기존과 동일)
     HISTORY_DIR = get_user_history_dir()
     if "editing_chat_file" not in st.session_state:
         st.session_state.editing_chat_file = None
-    # ... (display_chat_item, show_all_chats_dialog 등 대화 목록 UI 함수는 기존과 동일) ...
+    if "show_all_chats" not in st.session_state:
+        st.session_state.show_all_chats = False
+    if "dialog_items_to_show" not in st.session_state:
+        st.session_state.dialog_items_to_show = 10
+
     def display_chat_item(filename: str, key_prefix: str):
         """대화 목록 아이템을 표시하고 수정/삭제 UI를 제공하는 함수"""
         is_editing = st.session_state.get("editing_chat_file") == filename
@@ -655,10 +846,37 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "current_chat_file" not in st.session_state:
     st.session_state.current_chat_file = None
+if "last_response_text" not in st.session_state:
+    st.session_state.last_response_text = None
 
-for message in st.session_state.messages:
+# 이전 메시지 표시
+for i, message in enumerate(st.session_state.messages):
+    is_last_item = (i == len(st.session_state.messages) - 1)
     with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+        content = message["content"]
+        if isinstance(content, str):
+            st.markdown(content)
+        elif isinstance(content, list):
+            # 이미지 포함 메시지 렌더링
+            for item in content:
+                if item['type'] == 'text':
+                    st.markdown(item['text'])
+                elif item['type'] == 'image_url':
+                    st.image(item['image_url']['url'], width=300)
+        
+        # 어시스턴트 메시지이고 마지막 메시지인 경우 부가 정보 및 TTS 표시 (중복 방지)
+        if message["role"] == "assistant" and is_last_item:
+            st.badge("Answer by "+selected_item+"", icon=":material/check:", color="green")
+            
+            # TTS 버튼 및 플레이어
+            if st.session_state.last_response_text:
+                # 언어 감지
+                resp_lang = detect_language(st.session_state.last_response_text)
+                if st.button(f"🔊 답변 듣기 ({resp_lang.upper()})", key=f"tts_btn_{i}"):
+                    with st.spinner("음성을 생성 중입니다..."):
+                        audio_stream = text_to_speech_stream(st.session_state.last_response_text, lang=resp_lang)
+                        if audio_stream:
+                            st.audio(audio_stream, format="audio/mp3", start_time=0)
 
 st.markdown(
     """
@@ -668,29 +886,174 @@ st.markdown(
         bottom:60px;
         }
     }
+    /* 오디오 플레이어 스타일 조정 */
+    .stAudio {
+        margin-top: 10px;
+        width: 300px !important;
+    }
     </style>
     """,unsafe_allow_html=True
 )
-prompt = st.chat_input("질문을 입력하세요.")
-if prompt:
+
+# --- [신규] 입력창 설정 (오디오 및 파일 첨부 활성화) ---
+prompt_data = st.chat_input(
+    "질문을 입력하거나 파일을 첨부하세요.",
+    accept_audio=True,
+    accept_file=True,
+    file_type=["txt", "csv", "py", "js", "html", "css", "java", "ts", "pdf", "docx", "png", "jpg", "jpeg", "gif"]
+)
+
+if prompt_data:
     if not st.session_state.get("current_chat_file"):
         st.session_state.current_chat_file = generate_filename_with_timestamp()
 
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    user_text = prompt_data.get("text", "")
+    uploaded_files = prompt_data.get("files", [])
+    audio_data = prompt_data.get("audio")
 
-    with st.chat_message("assistant"):
-        history = [
-            HumanMessage(content=m['content']) if m['role'] == 'user' else AIMessage(content=m['content'])
-            for m in st.session_state.messages[:-1]
+    # [신규] 음성 입력(STT) 처리
+    if audio_data:
+        with st.status("음성을 텍스트로 변환 중...") as status:
+            try:
+                # 오디오 데이터 추출 및 Whisper API 호출
+                audio_bytes = None
+                audio_format = "audio/wav"
+
+                # 1. 딕셔너리 형태 (data 키)
+                if isinstance(audio_data, dict) and "data" in audio_data:
+                    audio_bytes = audio_data["data"]
+                    audio_format = audio_data.get("format", "audio/wav")
+                # 2. BytesIO/UploadedFile 형태 (getvalue 메서드)
+                elif hasattr(audio_data, "getvalue"):
+                    audio_bytes = audio_data.getvalue()
+                    audio_format = getattr(audio_data, "type", "audio/wav")
+                # 3. 직접 바이트 형태
+                elif isinstance(audio_data, bytes):
+                    audio_bytes = audio_data
+
+                if audio_bytes:
+                    extension = "wav"
+                    if "webm" in audio_format: extension = "webm"
+                    elif "mp3" in audio_format: extension = "mp3"
+                    elif "wav" in audio_format: extension = "wav"
+                    elif "ogg" in audio_format: extension = "ogg"
+
+                    audio_file = io.BytesIO(audio_bytes)
+                    audio_file.name = f"input.{extension}" 
+                    
+                    transcript = openai_client.audio.transcriptions.create(
+                        model="whisper-1", 
+                        file=audio_file,
+                        response_format="text"
+                    )
+                    if transcript and transcript.strip():
+                        transcript_text = transcript.strip()
+                        user_text = (user_text + " " + transcript_text).strip() if user_text else transcript_text
+                        status.update(label=f"음성 변환 완료! ({extension})", state="complete")
+                        st.toast(f"🎙️ 인식된 내용: {transcript_text}")
+                    else:
+                        st.warning("음성에서 텍스트를 추출하지 못했습니다.")
+                        status.update(label="음성 변환 실패 (텍스트 없음)", state="error")
+                else:
+                    st.error("오디오 데이터를 읽을 수 없습니다.")
+                    status.update(label="오디오 데이터 오류", state="error")
+            except Exception as e:
+                st.error(f"음성 인식 중 오류 발생: {e}")
+                status.update(label="음성 변환 실패", state="error")
+                
+    # 텍스트, 파일, 또는 음성 전사 결과가 있을 때만 프로세스 진행
+    if not user_text and not uploaded_files and not audio_data:
+        st.stop()
+
+    extracted_texts = []
+    image_data = None
+    
+    # 파일 처리 로직
+    if uploaded_files:
+        for uploaded_file in uploaded_files:
+            if "image" in uploaded_file.type:
+                # 이미지는 하나만 처리 (멀티 이미지 지원 필요 시 수정)
+                if image_data is None:
+                    base64_image = encode_image_to_base64(uploaded_file)
+                    if base64_image:
+                        image_data = base64_image
+                        with st.chat_message("user"):
+                            st.write(f"📷 이미지 첨부: {uploaded_file.name}")
+                            st.image(uploaded_file, width=200)
+            else:
+                # 텍스트 기반 파일 처리
+                text = extract_text_from_file(uploaded_file)
+                extracted_texts.append(f"--- 파일명: {uploaded_file.name} ---\n{text}\n--------------------------\n")
+                with st.chat_message("user"):
+                    st.write(f"📄 파일 첨부: {uploaded_file.name}")
+
+    # 최종 사용자 메시지 컨텐츠 구성
+    final_user_content: Union[str, List[Any]] = user_text
+    
+    if extracted_texts:
+        # 텍스트 파일 내용은 프롬프트 뒤에 붙임
+        final_user_content = user_text + "\n\n" + "".join(extracted_texts)
+    
+    if image_data:
+        # 이미지가 있는 경우 LangChain 멀티모달 메시지 형식으로 구성
+        final_user_content = [
+            {"type": "text", "text": user_text or "이 이미지를 분석해주세요."},
+            {"type": "image_url", "image_url": {"url": image_data}}
         ]
-        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-        # 핵심 로직 함수(process_query)가 생략되었으므로,
-        # 원본 코드의 process_query 함수 전체를 위에 붙여넣어야 정상 동작합니다.
-        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-        response = st.write_stream(process_query(prompt, history))
-        st.badge("Answer by "+selected_item+"", icon=":material/check:", color="green")
+        # 이미지가 있을 때는 텍스트만 있는 경우보다 우선시
 
-    st.session_state.messages.append({"role": "assistant", "content": response})
-    auto_save_chat()
+    # 사용자 메시지 저장 및 표시 (이미지는 위에서 이미 표시됨)
+    if isinstance(final_user_content, str):
+        st.session_state.messages.append({"role": "user", "content": final_user_content})
+        with st.chat_message("user"):
+            st.markdown(user_text) # 원본 텍스트만 보여줌 (파일 내용은 생략)
+    else:
+        # 이미지 포함 리스트 저장
+        st.session_state.messages.append({"role": "user", "content": final_user_content})
+        # 이미지는 파일 처리 루프에서 표시했으므로 텍스트만 표시
+        if user_text:
+             with st.chat_message("user"):
+                st.markdown(user_text)
+
+
+    # ---------------------------------------------------------
+    # [신규] 이미지 생성 요청 처리 (첨부파일 없고 키워드 감지 시)
+    # ---------------------------------------------------------
+    if not uploaded_files and isinstance(final_user_content, str) and ("이미지 생성" in final_user_content or "그려줘" in final_user_content):
+        with st.chat_message("assistant"):
+            st.write(f"🎨 {st.session_state.image_gen_model} 모델로 이미지를 생성하고 있습니다...")
+            generated_image_url = generate_image(final_user_content, st.session_state.image_gen_model)
+            if generated_image_url:
+                st.image(generated_image_url, caption=f"Generated by {st.session_state.image_gen_model}")
+                # 이미지 URL을 텍스트로 저장 (마크다운 이미지 문법 활용)
+                response_text = f"![생성된 이미지]({generated_image_url})\n\n요청하신 이미지를 {st.session_state.image_gen_model} 모델로 생성했습니다."
+            else:
+                response_text = "죄송합니다. 이미지 생성에 실패했습니다."
+                st.error(response_text)
+            
+            st.session_state.messages.append({"role": "assistant", "content": response_text})
+            st.session_state.last_response_text = None # 이미지 생성은 TTS 대상 제외
+        auto_save_chat()
+
+    # ---------------------------------------------------------
+    # 일반적인 MCP/LLM 질의 처리
+    # ---------------------------------------------------------
+    else:
+        with st.chat_message("assistant"):
+            # LangChain 메시지 객체로 변환 (이미지 처리 포함)
+            history = []
+            for m in st.session_state.messages[:-1]:
+                if m['role'] == 'user':
+                    history.append(HumanMessage(content=m['content']))
+                else:
+                    # 이전 어시스턴트 메시지가 이미지 링크인 경우 텍스트로 처리
+                    history.append(AIMessage(content=m['content']))
+            
+            # 스트리밍 응답 출력
+            response_text = st.write_stream(process_query(final_user_content, history))
+
+        # 응답 저장 및 TTS용 텍스트 캐싱
+        st.session_state.messages.append({"role": "assistant", "content": response_text})
+        st.session_state.last_response_text = response_text
+        auto_save_chat()
+        st.rerun() # 메시지 표시 루프에서 배지와 TTS 버튼이 나오도록 리런
